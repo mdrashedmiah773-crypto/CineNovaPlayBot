@@ -1,9 +1,18 @@
-# app-এর নাম আপনার Fly অ্যাপের নাম দিয়ে বদলে নিন
-app = 'cinenexus-bot'
+app = 'cinenovaplaybot'
 primary_region = 'sin'
+
+[build]
 
 [env]
   NODE_ENV = 'production'
+  PORT = '8080'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
 
 [[vm]]
   size = 'shared-cpu-1x'
