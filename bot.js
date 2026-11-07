@@ -1,6 +1,7 @@
 const http = require('http');
 const { Telegraf, Markup } = require('telegraf');
 const { message } = require('telegraf/filters');
+const crypto = require('crypto');
 const { MongoClient, ObjectId } = require('mongodb');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -8,6 +9,10 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const ADMIN_ID = Number(process.env.ADMIN_ID || 6066529085);
 const PORT = process.env.PORT || 8080;
 const PAGE_SIZE = 8;
+const PUBLIC_URL = (
+  process.env.PUBLIC_URL ||
+  (process.env.FLY_APP_NAME ? `https://${process.env.FLY_APP_NAME}.fly.dev` : '')
+).replace(/\/+$/, '');
 
 if (!BOT_TOKEN) {
   console.error('BOT_TOKEN সেট করা নেই!');
@@ -18,18 +23,12 @@ if (!MONGODB_URI) {
   process.exit(1);
 }
 
-// ---------- Fly.io হেলথ-চেকের জন্য ছোট ওয়েব সার্ভার ----------
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('CineNova Play bot is running');
-  })
-  .listen(PORT, '0.0.0.0', () => console.log(`HTTP server চালু: ${PORT}`));
-
 // ---------- ডাটাবেস ----------
 const mongo = new MongoClient(MONGODB_URI);
 let videos;
 let users;
+let tokens;
+let settings;
 
 // ---------- ডাটা ----------
 const CATEGORIES = [
@@ -83,10 +82,26 @@ function backMenu(target) {
   return Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', target)]]);
 }
 
-async function sendMedia(ctx, v) {
-  const opts = { caption: `🎬 ${v.title}` };
+async function sendMedia(ctx, v, protect = false) {
+  const opts = { caption: `🎬 ${v.title}`, protect_content: protect };
   if (v.kind === 'document') return ctx.replyWithDocument(v.fileId, opts);
   return ctx.replyWithVideo(v.fileId, opts);
+}
+
+async function getSetting(key, def) {
+  const d = await settings.findOne({ _id: key });
+  return d ? d.value : def;
+}
+const setSetting = (key, value) =>
+  settings.updateOne({ _id: key }, { $set: { value } }, { upsert: true });
+
+function validAdUrl(str) {
+  try {
+    const u = new URL(str);
+    return u.protocol === 'https:' && str.length <= 500;
+  } catch {
+    return false;
+  }
 }
 
 // ---------- ইউজার মেনু ----------
@@ -168,6 +183,7 @@ function adminMenu() {
       Markup.button.callback('🚫 Ban User', 'adm:ban'),
       Markup.button.callback('✅ Unban User', 'adm:unban'),
     ],
+    [Markup.button.callback('⚙️ Ad Settings', 'adm:ads')],
   ]);
 }
 
@@ -309,6 +325,50 @@ bot.action(/^vl:([a-z]+):(\d+)$/, async (ctx) => {
   await safeEdit(ctx, view.text, view.keyboard);
 });
 
+async function deliver(ctx, v) {
+  try {
+    await sendMedia(ctx, v, v.access === 'ad');
+    await videos.updateOne(
+      { _id: v._id },
+      { $inc: { views: 1, ...(v.access === 'ad' ? { unlocks: 1 } : {}) } }
+    );
+  } catch (err) {
+    console.error('sendMedia error:', err);
+    await ctx.reply('⚠️ ভিডিওটি পাঠানো যায়নি। একটু পরে আবার চেষ্টা করুন।');
+  }
+}
+
+async function startGate(ctx, v) {
+  const adUrl = await getSetting('adUrl', null);
+  if (!adUrl || !PUBLIC_URL) {
+    console.warn('Ad gate বন্ধ: Ad Link বা PUBLIC_URL সেট নেই, ভিডিও সরাসরি দেওয়া হচ্ছে।');
+    return deliver(ctx, v);
+  }
+  const wait = Number(await getSetting('waitSeconds', 10));
+  const token = crypto.randomBytes(16).toString('hex');
+  await tokens.insertOne({
+    _id: token,
+    userId: ctx.from.id,
+    videoId: v._id,
+    createdAt: new Date(),
+    openedAt: null,
+    used: false,
+  });
+  await ctx.reply(
+    `🔒 <b>${esc(v.title)}</b>\n\nভিডিওটি আনলক করতে:\n` +
+      `1️⃣ <b>Watch Ad</b> বাটনে চাপ দিয়ে অ্যাড পেজটি খুলুন\n` +
+      `2️⃣ পেজে ${wait} সেকেন্ড থাকুন\n` +
+      `3️⃣ এখানে ফিরে <b>Unlock Video</b> চাপুন`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.url('📺 Watch Ad', `${PUBLIC_URL}/watch/${token}`)],
+        [Markup.button.callback('🔓 Unlock Video', `uk:${token}`)],
+      ]),
+    }
+  );
+}
+
 bot.action(/^v:([a-f0-9]{24})$/, async (ctx) => {
   const id = toId(ctx.match[1]);
   const v = id && (await videos.findOne({ _id: id }));
@@ -316,13 +376,46 @@ bot.action(/^v:([a-f0-9]{24})$/, async (ctx) => {
     return ctx.answerCbQuery('ভিডিওটি পাওয়া যায়নি।', { show_alert: true });
   }
   await ctx.answerCbQuery();
-  try {
-    await sendMedia(ctx, v);
-    await videos.updateOne({ _id: id }, { $inc: { views: 1 } });
-  } catch (err) {
-    console.error('sendMedia error:', err);
-    await ctx.reply('⚠️ ভিডিওটি পাঠানো যায়নি। একটু পরে আবার চেষ্টা করুন।');
+  if (v.access === 'ad') return startGate(ctx, v);
+  return deliver(ctx, v);
+});
+
+bot.action(/^uk:([a-f0-9]{32})$/, async (ctx) => {
+  const t = await tokens.findOne({ _id: ctx.match[1] });
+  if (!t || t.userId !== ctx.from.id) {
+    return ctx.answerCbQuery('⚠️ লিংকটির মেয়াদ শেষ। ভিডিওতে আবার ক্লিক করুন।', {
+      show_alert: true,
+    });
   }
+  if (t.used) {
+    return ctx.answerCbQuery('এই লিংকটি আগেই ব্যবহার হয়েছে।', { show_alert: true });
+  }
+  if (!t.openedAt) {
+    return ctx.answerCbQuery('আগে "Watch Ad" চেপে অ্যাড পেজ খুলুন।', { show_alert: true });
+  }
+  const wait = Number(await getSetting('waitSeconds', 10));
+  const elapsed = (Date.now() - t.openedAt.getTime()) / 1000;
+  if (elapsed < wait) {
+    return ctx.answerCbQuery(`⏳ আরও ${Math.ceil(wait - elapsed)} সেকেন্ড অপেক্ষা করুন।`, {
+      show_alert: true,
+    });
+  }
+  const claim = await tokens.updateOne(
+    { _id: t._id, used: false },
+    { $set: { used: true, usedAt: new Date() } }
+  );
+  if (!claim.modifiedCount) {
+    return ctx.answerCbQuery('এই লিংকটি আগেই ব্যবহার হয়েছে।', { show_alert: true });
+  }
+  const v = await videos.findOne({ _id: t.videoId });
+  if (!v) {
+    return ctx.answerCbQuery('ভিডিওটি পাওয়া যায়নি।', { show_alert: true });
+  }
+  await ctx.answerCbQuery('✅ আনলক হয়েছে!');
+  await deliver(ctx, v);
+  await safeEdit(ctx, '✅ <b>আনলক হয়েছে!</b> ভিডিও উপরে/নিচে পাঠানো হয়েছে।', backMenu('menu:main')).catch(
+    () => {}
+  );
 });
 
 // ---------- অ্যাডমিন: প্যানেল ----------
@@ -525,6 +618,55 @@ adminAction(/^dy:([a-f0-9]{24})$/, async (ctx) => {
   await safeEdit(ctx, '🗑 ভিডিওটি ডিলিট হয়েছে।', backMenu('ml:0'));
 });
 
+// ---------- অ্যাডমিন: Ad Settings ----------
+adminAction('adm:ads', async (ctx) => {
+  adminState = null;
+  const adUrl = await getSetting('adUrl', null);
+  const wait = await getSetting('waitSeconds', 10);
+  await safeEdit(
+    ctx,
+    '⚙️ <b>Ad Settings</b>\n\n' +
+      `🔗 Ad Link: ${adUrl ? `<code>${esc(adUrl)}</code>` : '❌ সেট করা নেই'}\n` +
+      `⏱ অপেক্ষার সময়: ${wait} সেকেন্ড\n` +
+      `🌐 Gate URL: ${PUBLIC_URL ? `<code>${esc(PUBLIC_URL)}</code>` : '❌ সেট নেই'}`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback('🔗 Set Ad Link', 'ads:url'),
+        Markup.button.callback('⏱ Set Wait Time', 'ads:wait'),
+      ],
+      [Markup.button.callback('🗑 Remove Ad Link', 'ads:rm')],
+      [Markup.button.callback('⬅️ Panel', 'adm:panel')],
+    ])
+  );
+});
+
+adminAction('ads:url', async (ctx) => {
+  adminState = { step: 'set_adurl', data: {} };
+  await safeEdit(
+    ctx,
+    '🔗 আপনার <b>Adsterra Direct Link</b> পাঠান (https দিয়ে শুরু হতে হবে):',
+    backMenu('adm:ads')
+  );
+});
+
+adminAction('ads:wait', async (ctx) => {
+  adminState = { step: 'set_wait', data: {} };
+  await safeEdit(
+    ctx,
+    '⏱ অ্যাড পেজে কত <b>সেকেন্ড</b> অপেক্ষা করতে হবে? (৩ থেকে ৬০):',
+    backMenu('adm:ads')
+  );
+});
+
+adminAction('ads:rm', async (ctx) => {
+  await settings.deleteOne({ _id: 'adUrl' });
+  await safeEdit(
+    ctx,
+    '🗑 Ad Link মুছে ফেলা হয়েছে। নতুন লিংক না দেওয়া পর্যন্ত 🔒 ভিডিও সরাসরি যাবে।',
+    backMenu('adm:ads')
+  );
+});
+
 // ---------- অ্যাডমিন: স্ট্যাটস ----------
 adminAction('adm:stats', async (ctx) => {
   const [totalUsers, bannedUsers, totalVideos, viralVideos, adVideos, agg] =
@@ -534,15 +676,20 @@ adminAction('adm:stats', async (ctx) => {
       videos.countDocuments({}),
       videos.countDocuments({ viral: true }),
       videos.countDocuments({ access: 'ad' }),
-      videos.aggregate([{ $group: { _id: null, views: { $sum: '$views' } } }]).toArray(),
+      videos
+        .aggregate([
+          { $group: { _id: null, views: { $sum: '$views' }, unlocks: { $sum: '$unlocks' } } },
+        ])
+        .toArray(),
     ]);
   const views = agg[0] ? agg[0].views : 0;
+  const unlocks = agg[0] ? agg[0].unlocks : 0;
   await safeEdit(
     ctx,
     '📊 <b>Stats</b>\n\n' +
       `👥 ইউজার: ${totalUsers}\n🚫 ব্যান: ${bannedUsers}\n\n` +
       `🎬 ভিডিও: ${totalVideos}\n🔥 Viral: ${viralVideos}\n🔒 Ad-unlock: ${adVideos}\n` +
-      `👁 মোট Views: ${views}`,
+      `👁 মোট Views: ${views}\n🔓 মোট Unlock (অ্যাড দেখে): ${unlocks}`,
     backMenu('adm:panel')
   );
 });
@@ -639,6 +786,25 @@ bot.on(message('text'), async (ctx, next) => {
     return showDetail(ctx, String(st.data.id), false);
   }
 
+  if (st.step === 'set_adurl') {
+    if (!validAdUrl(text)) {
+      return ctx.reply('⚠️ সঠিক https লিংক দিন (যেমন https://...)।', cancelMenu());
+    }
+    adminState = null;
+    await setSetting('adUrl', text);
+    return ctx.reply('✅ Ad Link সেভ হয়েছে।', backMenu('adm:ads'));
+  }
+
+  if (st.step === 'set_wait') {
+    const n = Number(text);
+    if (!Number.isInteger(n) || n < 3 || n > 60) {
+      return ctx.reply('⚠️ ৩ থেকে ৬০ এর মধ্যে একটি সংখ্যা দিন।', cancelMenu());
+    }
+    adminState = null;
+    await setSetting('waitSeconds', n);
+    return ctx.reply(`✅ অপেক্ষার সময় ${n} সেকেন্ড করা হয়েছে।`, backMenu('adm:ads'));
+  }
+
   if (st.step === 'ban' || st.step === 'unban') {
     const uid = Number(text);
     if (!Number.isInteger(uid) || uid <= 0) {
@@ -697,14 +863,136 @@ bot.catch((err, ctx) => {
   console.error(`Error (update ${ctx.update.update_id}):`, err);
 });
 
+// ---------- ওয়েব সার্ভার (হেলথ-চেক + অ্যাড পেজ) ----------
+function expiredPage() {
+  return `<!doctype html><html lang="bn"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CineNova Play</title></head><body style="font-family:system-ui,sans-serif;background:#0f1222;color:#fff;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:16px;text-align:center"><div><h2>⚠️ লিংকটির মেয়াদ শেষ</h2><p>টেলিগ্রামে ফিরে ভিডিওতে আবার ক্লিক করুন।</p></div></body></html>`;
+}
+
+function renderWatchPage(token, adUrl, wait, botUser) {
+  const adJson = JSON.stringify(adUrl).replace(/</g, '\\u003c');
+  const safeBot = String(botUser).replace(/[^A-Za-z0-9_]/g, '');
+  const w = Number(wait) || 10;
+  return `<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>CineNova Play</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0f1222;color:#fff;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:16px}
+.card{max-width:420px;width:100%;background:#1a1f3a;border-radius:16px;padding:24px;text-align:center}
+.muted{color:#9aa3c7;font-size:14px}
+button,a.btn{display:block;width:100%;padding:14px;border:0;border-radius:12px;font-size:16px;font-weight:600;background:#ff4d4f;color:#fff;text-decoration:none;margin-top:16px;cursor:pointer;box-sizing:border-box}
+#timer{font-size:44px;font-weight:700;margin:12px 0}
+.hide{display:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>🎬 CineNova Play</h2>
+  <p class="muted">ভিডিও আনলক করতে নিচের ধাপগুলো অনুসরণ করুন</p>
+  <div id="step1">
+    <p>১. নিচের বাটনে চাপ দিয়ে অ্যাড পেজটি খুলুন</p>
+    <button id="openBtn">📺 Open Ad</button>
+  </div>
+  <div id="step2" class="hide">
+    <p>২. অ্যাড পেজে অন্তত <b>${w}</b> সেকেন্ড থাকুন, তারপর এখানে ফিরে আসুন</p>
+    <div id="timer">${w}</div>
+  </div>
+  <div id="step3" class="hide">
+    <p>✅ হয়ে গেছে! এবার টেলিগ্রামে ফিরে <b>Unlock Video</b> বাটন চাপুন।</p>
+    <a class="btn" href="https://t.me/${safeBot}">টেলিগ্রামে ফিরুন</a>
+  </div>
+</div>
+<script>
+var TOKEN = "${token}";
+var AD_URL = ${adJson};
+var WAIT = ${w};
+var started = false;
+
+function startTimer() {
+  document.getElementById('step2').className = '';
+  var left = WAIT;
+  var el = document.getElementById('timer');
+  el.textContent = left;
+  var iv = setInterval(function () {
+    left--;
+    el.textContent = left > 0 ? left : 0;
+    if (left <= 0) {
+      clearInterval(iv);
+      document.getElementById('step2').className = 'hide';
+      document.getElementById('step3').className = '';
+    }
+  }, 1000);
+}
+
+document.getElementById('openBtn').onclick = function () {
+  var win = window.open(AD_URL, '_blank');
+  var p = fetch('/api/opened/' + TOKEN, { method: 'POST' }).catch(function () {});
+  if (!win) {
+    p.then(function () { location.href = AD_URL; });
+    return;
+  }
+  if (!started) { started = true; startTimer(); }
+};
+</script>
+</body>
+</html>`;
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const path = (req.url || '/').split('?')[0];
+
+    let m = path.match(/^\/watch\/([a-f0-9]{32})$/);
+    if (req.method === 'GET' && m) {
+      const t = tokens ? await tokens.findOne({ _id: m[1] }) : null;
+      const adUrl = settings ? await getSetting('adUrl', null) : null;
+      res.setHeader('Cache-Control', 'no-store');
+      if (!t || t.used || !adUrl) {
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(expiredPage());
+      }
+      const wait = Number(await getSetting('waitSeconds', 10));
+      const botUser = (bot.botInfo && bot.botInfo.username) || 'CineNovaPlayBot';
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(renderWatchPage(m[1], adUrl, wait, botUser));
+    }
+
+    m = path.match(/^\/api\/opened\/([a-f0-9]{32})$/);
+    if (req.method === 'POST' && m) {
+      if (tokens) {
+        await tokens.updateOne(
+          { _id: m[1], used: false, openedAt: null },
+          { $set: { openedAt: new Date() } }
+        );
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('CineNova Play bot is running');
+  } catch (err) {
+    console.error('HTTP error:', err);
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end('error');
+  }
+});
+server.listen(PORT, '0.0.0.0', () => console.log(`HTTP server চালু: ${PORT}`));
+
 // ---------- চালু ----------
 async function main() {
   await mongo.connect();
   const db = mongo.db('cinenova');
   videos = db.collection('videos');
   users = db.collection('users');
+  tokens = db.collection('tokens');
+  settings = db.collection('settings');
   await videos.createIndex({ category: 1, createdAt: -1 });
   await videos.createIndex({ viral: 1, createdAt: -1 });
+  await tokens.createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 });
   const banned = await users.find({ banned: true }).project({ _id: 1 }).toArray();
   banned.forEach((u) => bannedIds.add(u._id));
   console.log('MongoDB সংযুক্ত ✅');
@@ -725,7 +1013,9 @@ main().catch((err) => {
 });
 
 const shutdown = (sig) => {
-  bot.stop(sig);
+  try {
+    bot.stop(sig);
+  } catch {}
   mongo.close().catch(() => {});
 };
 process.once('SIGINT', () => shutdown('SIGINT'));
