@@ -1,0 +1,16 @@
+{
+  "name": "cinenexus-bot",
+  "version": "1.0.0",
+  "description": "CineNexus Telegram streaming/OTT bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "telegraf": "^4.16.3"
+  }
+}

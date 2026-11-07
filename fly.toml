@@ -1,0 +1,10 @@
+# app-এর নাম আপনার Fly অ্যাপের নাম দিয়ে বদলে নিন
+app = 'cinenexus-bot'
+primary_region = 'sin'
+
+[env]
+  NODE_ENV = 'production'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
