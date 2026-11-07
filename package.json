@@ -1,5 +1,5 @@
 {
-  "name": "cinenova-bot",
+  "name": "CineNovaPlayBot",
   "version": "1.1.0",
   "description": "CineNova Play Telegram streaming/OTT bot",
   "main": "bot.js",
